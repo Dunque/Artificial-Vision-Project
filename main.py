@@ -1,94 +1,96 @@
-import sys
+import os
 import cv2
-import os.path
+from skimage.feature import peak_local_max
+from skimage.segmentation import watershed
+from scipy import ndimage
 import numpy as np
-import matplotlib.pyplot as plt
+import imutils
 
-inputImageStr = './img/1 (1).png'
-outputImageStr = './output1.jpeg'
-verbose = False
+import numpy as np
 
+imgPath = "input/"
+imgPathOut = "output/"
 
-def printResults(input,outImage):
-	title = 'Input Image'
-	fig1 = plt.figure(num=title)
-	plt.imshow(input)
-	plt.title(title)
-	plt.axis('off')
-
-	title = 'Output Image'
-	fig2 = plt.figure(num=title)
-	plt.imshow(outImage)
-	plt.title(title)
-	plt.axis('off')
-
-	plt.show()
-
-def segmentar_plantones(inputImage):
-    light_green = (255,255,75)
-    dark_green = (0,110,0)
-
-    inputImage= cv2.GaussianBlur(inputImage, (15, 15), 0)
-    mask = cv2.inRange(inputImage, dark_green,light_green)
-    kernel = np.ones((8,8))
-    close = cv2.morphologyEx(mask,cv2.MORPH_CLOSE, kernel)
-    open = cv2.morphologyEx(close,cv2.MORPH_OPEN, kernel)
-
-    sure_bg = cv2.dilate(open, kernel, iterations=3)
-    dist_transform = cv2.distanceTransform(open, cv2.DIST_L2, 5)
-    ret, sure_fg = cv2.threshold(dist_transform, 0.2 * dist_transform.max(), 255, 0)
-    sure_fg = np.uint8(sure_fg)
-    unknown = cv2.subtract(sure_bg, sure_fg)
-
-    ret, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-    markers = cv2.watershed(inputImage, markers)
-
-    return markers
 
 def main():
-    inputImage = cv2.imread(inputImageStr, 1)
-    inputImage2 = cv2.cvtColor(inputImage, cv2.COLOR_BGR2RGB)
-    outputImage = segmentar_plantones(inputImage2)
 
-    cv2.imwrite(outputImageStr, outputImage)
+    #Loading the input images
+    list_files = os.listdir(imgPath)
 
-    if verbose:
-        printResults(inputImage2,outputImage)
+    for filename in list_files:
+        inputImg = cv2.imread(imgPath+filename, 1)
+        #Convert to RGB
+        img = cv2.cvtColor(inputImg, cv2.COLOR_BGR2RGB)
 
-def printHelp():
-    print(f"\nSegmentación de Plantones\nUso:\n")
-    print(f"  -i  --input:\t\tImagen de entrada\n\t\t\tPor defecto: [{inputImageStr}]\n")
-    print(f"  -o  --output:\t\tImagen de salida\n\t\t\tPor defecto: [{outputImageStr}]\n")
-    print(f"  -h  --help:\t\tAyuda\n")
-    print(f"  -v  --verbose:\tMostrar debug\n")
-    quit()
+        # -------------------- BACKGROUND REMOVAL --------------------
 
-def parseArguments(argv):
-    global inputImageStr
-    global outputImageStr
-    global verbose
+        #Green thresholding
+        mask = cv2.inRange(img, (0,80,0), (255,255,75))
 
-    arguments=iter(argv)
-    for arg in arguments:
-        if arg=='-h' or arg =='--help':
-            printHelp()
-        if arg=='-i' or arg=='--input':
-            next=arguments._next_()
-            inputImageStr=next if os.path.isfile(next) else inputImageStr
-        if arg=='-o' or arg=='--output':
-            next=arguments._next_()
-            outputImageStr=next
-        if arg=='-v' or arg=='--verbose':
-            verbose=True
+        # noise removal
+        kernel = np.ones((4,4),np.uint8)
+        opening = cv2.morphologyEx(mask,cv2.MORPH_OPEN,kernel, iterations = 2)
+        closing = cv2.morphologyEx(opening,cv2.MORPH_CLOSE, kernel, iterations = 2)
 
-    if verbose:
-        print(f"\nUsing:")
-        print(f"Input Image: {inputImageStr}")
-        print(f"Output Image: {outputImageStr}\n")
+        bw_img = cv2.threshold(closing,127,255,cv2.THRESH_BINARY)[1]
 
+        trimmedPlants = cv2.bitwise_and(img,img,mask = bw_img)
 
-if __name__ == "__main__":
-    parseArguments(sys.argv[1:])
+        # convert to grayscale, then apply Otsu
+        gray = cv2.cvtColor(trimmedPlants, cv2.COLOR_BGR2GRAY)
+        thresh = cv2.threshold(gray, 0, 255,
+            cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+        
+        # show the output image
+        cv2.imwrite("otsu/"+filename, thresh)
+
+        # -------------------- LEAF SEGMENTATION --------------------
+
+        # Euclidean distance from every binary pixel to the nearest zero pixel, 
+        # then find peaks in the distance map, with a minimum distance of eachother
+        D = ndimage.distance_transform_edt(thresh)
+        localMax = peak_local_max(D, indices=False, min_distance=17, labels=thresh)
+
+        # show the output image
+        cv2.imwrite("euclideanDistance/"+filename, D+128)
+
+        # perform a connected component analysis on the local peaks with 8-connectivity
+        # then appy the Watershed algorithm
+        # D is negated because watershed interprets it as local minimums
+        markers = ndimage.label(localMax, structure=np.ones((3, 3)))[0]
+        labels = watershed(-D, markers, mask=thresh)
+        print("Found " + str((len(np.unique(labels)) - 1)) + " unique segments in Image " + filename)
+
+        # -------------------- RESULTS --------------------
+
+        colorArray = [(0,0,255),(0,255,0),(255,0,0),(255,255,0),(255,0,255),(0,255,255),
+                    (0,0,128),(0,128,0),(128,0,0),(128,128,0),(128,0,128),(0,128,128),
+                    (128,128,255),(128,255,128),(255,128,128),(255,255,128),(255,128,255),(128,255,255)]
+        i = 0;
+
+        # loop over the unique labels returned by the Watershed
+        for label in np.unique(labels):
+            # label 0 is the background, so we ignore it
+            if label == 0:
+                continue
+            # otherwise, we draw the regions in the mask
+            mask = np.zeros(gray.shape, dtype="uint8")
+            mask[labels == label] = 255
+
+            # detect contours in the mask and grab the largest one
+            cnts = cv2.findContours(mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cnts = imutils.grab_contours(cnts)
+
+            #We draw the contours, choosing a color from the list
+            if (i==len(colorArray)-1):
+                i=0
+            else:
+                i=i+1
+                
+            cv2.fillPoly(trimmedPlants, cnts, colorArray[i])
+                
+        # show the output image
+        cv2.imwrite(imgPathOut+filename, trimmedPlants)
+
+if __name__ =='__main__':
     main()
